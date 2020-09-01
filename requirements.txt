@@ -1,0 +1,5 @@
+python-dotenv==0.13.0
+hvac==0.10.1
+requests
+yq
+awscli

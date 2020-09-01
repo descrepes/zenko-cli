@@ -1,0 +1,262 @@
+#!/usr/local/bin/python
+# -*- coding: utf-8 -*-
+
+# Copyright (C) 2009-2015:
+#    Alexandre Le Mao, alexandre.lemao@gmail.com
+
+"""
+Script to manage Zenko accounts and storage locations
+"""
+
+import hvac
+import json
+import os
+import re
+import sys
+import requests
+
+from dotenv import find_dotenv, load_dotenv
+from os.path import join, abspath
+
+from argparse import ArgumentParser
+from argparse import RawDescriptionHelpFormatter
+from argparse import ArgumentTypeError
+
+__all__ = []
+__version__ = 0.2
+__date__ = '2019-10-02'
+__updated__ = '2020-05-03'
+
+DEBUG = 0
+
+def process_location(args, zenko_api_endpoint):
+    name = args.locationName
+    locationType = args.locationType
+    accessKey = os.environ.get('LOCATION_ACCESS_KEY')
+    secretKey = os.environ.get('LOCATION_SECRET_KEY')
+    bucket = args.locationBucketName
+    endpoint = args.locationEndpoint
+    token = os.environ.get('ZENKO_ACCESS_TOKEN')
+    instance = os.environ.get('ZENKO_INSTANCE_ID')
+
+    payload = {}
+    headers = {'content-type': 'application/json', 'x-authentication-token': token}
+
+    payload['name'] = name
+    payload['locationType'] = locationType
+    payload['objectId'] = ''
+    payload['isTransient'] = False
+    payload['isBuiltin'] = False
+    payload['sizeLimitGB'] = 0
+    payload['details'] = {}
+    payload['details']['bucketMatch'] = False
+    payload['details']['accessKey'] = accessKey
+    payload['details']['secretKey'] = secretKey
+    payload['details']['bucketName'] = bucket
+    payload['details']['endpoint'] = endpoint
+
+    try:
+        r = requests.post(zenko_api_endpoint+instance+'/location', data=json.dumps(payload), headers=headers)
+        if r.status_code == 201:
+            print(r.text)
+        elif r.status_code == 409:
+            print(u"Location %s already exists !" % (name))
+        else:
+            print(u"Fail to create location %s: status code %s" % (name, r.status_code))
+        return 0
+    except Exception as ex:
+        print("ERROR: An exception occured while calling the Zenko API: %s" % (ex))
+        return 2
+
+
+def process_user(args, zenko_api_endpoint):
+    username = args.username
+    token = os.environ.get('ZENKO_ACCESS_TOKEN')
+    instance = os.environ.get('ZENKO_INSTANCE_ID')
+
+    payload = {}
+    headers = {'content-type': 'application/json', 'x-authentication-token': token}
+
+    payload['userName'] = username
+    try:
+        r = requests.post(zenko_api_endpoint+instance+'/user', data=json.dumps(payload), headers=headers)
+        if r.status_code == 201:
+            if args.storeVault:
+                if not "VAULT_ADDR" in os.environ:
+                    print("VAULT_ADDR environment variable is mandatory !")
+                    return 2
+
+                if args.vaultAuthMethod == "token":
+                    if not "VAULT_TOKEN" in os.environ:
+                        print("VAULT_TOKEN environment variable is mandatory !")
+                        return 2
+                    else:
+                        vault = hvac.Client(
+                            verify=False,
+                            url=os.environ.get('VAULT_ADDR'),
+                            token=os.environ.get('VAULT_TOKEN')
+                        )
+                elif args.vaultAuthMethod == "kubernetes":
+                        f = open('/var/run/secrets/kubernetes.io/serviceaccount/token')
+                        jwt = f.read()
+                        vault = hvac.Client(
+                            verify=False,
+                            url=os.environ.get('VAULT_ADDR'),
+                        )
+                        vault.auth_kubernetes("zenko", jwt)
+                else:
+                    print("Vault authentication method not recognized !")
+                    return 2
+
+                d = r.json()
+                if vault.is_authenticated():
+                    try:
+                        vault.secrets.kv.v2.create_or_update_secret(
+                            path='zenko/accounts/'+username,
+                            secret=dict(key_id=d['accessKey'], key_secret=d['secretKey']),
+                            mount_point='customers',
+                        )
+                    except Exception as ex:
+                        print("ERROR: An exception occured while saving to Vault: %s" % (ex))
+                        return 2
+
+                else:
+                    print("Vault authentication failed !")
+                    return 2
+            else:
+                print(r.text)
+        elif r.status_code == 409:
+            print(u"User %s already exists !" % (username))
+            return 2
+        else:
+            print(u"Fail to create user %s !" % (username))
+        return 0
+    except Exception as ex:
+        print("ERROR: An exception occured while calling the Zenko API: %s" % (ex))
+        return 2
+
+
+
+def add_user_command_options(subparsers):
+    # create the parser for the "ftp" command
+    parser_user = subparsers.add_parser('user', help='Add a Zenko account')
+    parser_user.add_argument('--username',
+                              action='store',
+                              dest='username',
+                              help='Username *',
+                              required=True,
+                              metavar="USERNAME")
+    parser_user.add_argument('--store-in-vault',
+                              action='store_true',
+                              dest='storeVault',
+                              help='Store the new account in Vault. VAULT_ADDRESS environment variables should be set *',
+                              default=False,
+                              required=False)
+    parser_user.add_argument('--vault-auth-method',
+                              action='store',
+                              dest='vaultAuthMethod',
+                              help='Vault authetication method. kubernetes or token. If token method is used, VAULT_TOKEN environment variable should be set *',
+                              default='token',
+                              required=False)
+
+
+def add_location_command_options(subparsers):
+    # create the parser for the "ftp" command
+    parser_location = subparsers.add_parser('location', help='Add a Zenko Storage Location')
+    parser_location.add_argument('--location-name',
+                              action='store',
+                              dest='locationName',
+                              help='Location Name *',
+                              required=True,
+                              metavar="LOCATIONNAME")
+    parser_location.add_argument('--location-type',
+                              action='store',
+                              dest='locationType',
+                              help='Location Type *',
+                              required=True,
+                              metavar="LOCATIONTYPE")
+    parser_location.add_argument('--location-bucket-name',
+                              action='store',
+                              dest='locationBucketName',
+                              help='Location Bucket Name *',
+                              required=True,
+                              metavar="LOCATIONBUCKETNAME")
+    parser_location.add_argument('--location-endpoint',
+                              action='store',
+                              dest='locationEndpoint',
+                              help='Location Endpoint *',
+                              required=True,
+                              metavar="LOCATIONENDPOINT")
+
+
+
+########
+# Main #
+########
+def main(argv=None): # IGNORE:C0111
+    '''Command line options.'''
+
+    if argv is None:
+        argv = sys.argv
+    else:
+        sys.argv.extend(argv)
+
+    program_name = os.path.basename(sys.argv[0])
+    program_version = "v%s" % __version__
+    program_build_date = str(__updated__)
+    program_version_message = '%%(prog)s %s (%s)' % (program_version, program_build_date)
+    program_shortdesc = __import__('__main__').__doc__.split("\n")[1]
+    program_license = '''%s
+
+  Created by Alexandre Le Mao on %s.
+  Copyright 2020 Insideboard. All rights reserved.
+
+USAGE
+''' % (program_shortdesc, str(__date__))
+
+    try:
+        # Setup argument parser
+        parser = ArgumentParser(description=program_license, formatter_class=RawDescriptionHelpFormatter)
+        parser.add_argument('-v', '--version', action='version', version=program_version_message)
+        parser.add_argument('-f', '--from-env-file', action='store', dest='fromEnvFile', help='Use env file *')
+
+        subparsers = parser.add_subparsers(dest='command', title='Sub command')
+
+        add_user_command_options(subparsers)
+        add_location_command_options(subparsers)
+
+        args = parser.parse_args()
+
+        if args.fromEnvFile is not None:
+            load_dotenv(dotenv_path=os.path.abspath(args.fromEnvFile))
+
+        zenko_api_endpoint = os.environ.get('ZENKO_API_ENDPOINT', 'https://api.zenko.io/api/v1/config/')
+        if not "ZENKO_ACCESS_TOKEN" in os.environ:
+            print("ZENKO_ACCESS_TOKEN environment variable is mandatory !")
+        if not "ZENKO_INSTANCE_ID" in os.environ:
+            print("ZENKO_INSTANCE_ID environment variable is mandatory !")
+
+        if args.command == "user":
+            return process_user(args, zenko_api_endpoint)
+        elif args.command == "location":
+            if not "LOCATION_ACCESS_KEY" in os.environ:
+                print("LOCATION_ACCESS_KEY environment variable is mandatory !")
+            if not "LOCATION_SECRET_KEY" in os.environ:
+                print("LOCATION_SECRET_KEY environment variable is mandatory !")
+
+            return process_location(args, zenko_api_endpoint)
+        else:
+            parser.print_usage()
+
+
+        return 0
+    except KeyboardInterrupt:
+        ### handle keyboard interrupt ###
+        return 0
+
+if __name__ == "__main__":
+    if DEBUG:
+        sys.argv.append("-h")
+        sys.argv.append("-v")
+    sys.exit(main())
+
